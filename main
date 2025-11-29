@@ -4,8 +4,10 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.storage.memory import MemoryStorage
+from datetime import datetime
+import random
 
 # Настройки
 BOT_TOKEN = "8525067714:AAEDsOTfqxrmHhcM6by3x0sGkagDUwthHbQ"
@@ -19,6 +21,7 @@ dp = Dispatcher(storage=storage)
 # "База данных" пользователей (в реальном проекте используйте БД)
 users_db = {}
 orders_db = []
+pending_payments = []  # Список ожидающих пополнений
 
 # Стейты для FSM
 class OrderStates(StatesGroup):
@@ -30,6 +33,8 @@ class OrderStates(StatesGroup):
 class AdminStates(StatesGroup):
     waiting_for_user_id = State()
     waiting_for_amount = State()
+    waiting_for_rejection_reason = State()
+    waiting_for_screenshot = State()
 
 class PaymentStates(StatesGroup):
     waiting_for_amount = State()
@@ -67,11 +72,19 @@ def get_admin_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="💰 Пополнить баланс пользователю")],
+            [KeyboardButton(text="⏳ Ожидающие пополнения")],
+            [KeyboardButton(text="📋 Ожидающие заказы")],
             [KeyboardButton(text="📊 Статистика")],
             [KeyboardButton(text="⬅️ Назад")]
         ],
         resize_keyboard=True
     )
+
+def generate_payment_id():
+    return random.randint(100000, 999999)
+
+def generate_order_id():
+    return random.randint(100000, 999999)
 
 # Инициализация пользователя
 def init_user(user_id):
@@ -186,17 +199,41 @@ async def process_screenshot(message: types.Message, state: FSMContext):
         await message.answer("Пожалуйста, отправьте скриншот чека об оплате:", reply_markup=get_cancel_keyboard())
         return
     
-    # Формируем заявку для администратора
+    # Сохраняем заявку на пополнение
+    payment_id = generate_payment_id()
+    payment_request = {
+        'id': payment_id,
+        'user_id': user_id,
+        'amount': amount,
+        'screenshot_file_id': message.photo[-1].file_id,
+        'username': message.from_user.username,
+        'user_full_name': message.from_user.full_name,
+        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'status': 'pending'
+    }
+    pending_payments.append(payment_request)
+    
+    # Формируем заявку для администратора с инлайн-кнопками
     payment_text = (
         "💰 Новая заявка на пополнение баланса!\n\n"
-        f"👤 Пользователь: @{message.from_user.username or 'Нет username'}\n"
+        f"👤 Пользователь: {message.from_user.full_name}\n"
+        f"📛 @{message.from_user.username or 'Нет username'}\n"
         f"🆔 ID: {user_id}\n"
         f"💳 Сумма: {amount} руб.\n"
-        f"📸 Скриншот отправлен"
+        f"⏰ Время: {payment_request['timestamp']}"
     )
     
-    # Пересылаем скриншот администратору
-    await bot.send_photo(ADMIN_CHAT_ID, message.photo[-1].file_id, caption=payment_text)
+    # Создаем инлайн-кнопки
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"approve_payment_{payment_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_payment_{payment_id}")
+        ]
+    ])
+    
+    # Пересылаем скриншот администратору с кнопками
+    await bot.send_photo(ADMIN_CHAT_ID, message.photo[-1].file_id, 
+                        caption=payment_text, reply_markup=keyboard)
     
     await message.answer(
         "✅ Заявка на пополнение баланса отправлена!\n\n"
@@ -217,12 +254,16 @@ async def admin_panel(message: types.Message):
     total_users = len(users_db)
     total_orders = len(orders_db)
     total_balance = sum(user['balance'] for user in users_db.values())
+    pending_count = len([p for p in pending_payments if p['status'] == 'pending'])
+    pending_orders_count = len([o for o in orders_db if o.get('status') == 'pending'])
     
     await message.answer(
         f"⚙️ Админ-панель\n\n"
         f"👥 Пользователей: {total_users}\n"
-        f"📊 Заказов: {total_orders}\n"
-        f"💰 Общий баланс: {total_balance} руб.",
+        f"📊 Всего заказов: {total_orders}\n"
+        f"⏳ Ожидающих заказов: {pending_orders_count}\n"
+        f"💰 Общий баланс: {total_balance} руб.\n"
+        f"💳 Ожидающих пополнений: {pending_count}",
         reply_markup=get_admin_keyboard()
     )
 
@@ -307,6 +348,394 @@ async def get_amount(message: types.Message, state: FSMContext):
     )
     await state.clear()
 
+# Ожидающие пополнения
+@dp.message(F.text == "⏳ Ожидающие пополнения")
+async def show_pending_payments(message: types.Message):
+    if message.from_user.id != ADMIN_CHAT_ID:
+        await message.answer("Доступ запрещен")
+        return
+        
+    pending_list = [p for p in pending_payments if p['status'] == 'pending']
+    
+    if not pending_list:
+        await message.answer(
+            "Нет ожидающих пополнений.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    # Отправляем каждую заявку отдельным сообщением с кнопками
+    for payment in pending_list:
+        text = (
+            f"⏳ Заявка на пополнение:\n\n"
+            f"👤 Пользователь: {payment['user_full_name']}\n"
+            f"📛 @{payment['username'] or 'Нет username'}\n"
+            f"🆔 ID: {payment['user_id']}\n"
+            f"💰 Сумма: {payment['amount']} руб.\n"
+            f"⏰ Время: {payment['timestamp']}"
+        )
+        
+        # Создаем инлайн-кнопки
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"approve_payment_{payment['id']}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_payment_{payment['id']}")
+            ]
+        ])
+        
+        # Отправляем скриншот с кнопками
+        await bot.send_photo(
+            message.chat.id,
+            payment['screenshot_file_id'],
+            caption=text,
+            reply_markup=keyboard
+        )
+    
+    await message.answer(
+        f"Всего ожидающих пополнений: {len(pending_list)}",
+        reply_markup=get_admin_keyboard()
+    )
+
+# Обработка нажатия на кнопку подтверждения платежа
+@dp.callback_query(F.data.startswith("approve_payment_"))
+async def approve_payment(callback: types.CallbackQuery):
+    payment_id = int(callback.data.split("_")[2])
+    
+    # Находим заявку
+    payment = None
+    for p in pending_payments:
+        if p['id'] == payment_id and p['status'] == 'pending':
+            payment = p
+            break
+    
+    if not payment:
+        await callback.answer("Заявка не найдена или уже обработана", show_alert=True)
+        return
+    
+    user_id = payment['user_id']
+    amount = payment['amount']
+    
+    # Инициализируем пользователя если его нет
+    init_user(user_id)
+    
+    # Пополняем баланс
+    users_db[user_id]['balance'] += amount
+    
+    # Помечаем заявку как обработанную
+    payment['status'] = 'approved'
+    
+    # Обновляем сообщение у администратора
+    new_text = (
+        f"✅ ПОДТВЕРЖДЕНО\n\n"
+        f"👤 Пользователь: {payment['user_full_name']}\n"
+        f"📛 @{payment['username'] or 'Нет username'}\n"
+        f"🆔 ID: {payment['user_id']}\n"
+        f"💰 Сумма: {payment['amount']} руб.\n"
+        f"⏰ Время: {payment['timestamp']}\n"
+        f"🕐 Обработано: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    
+    await callback.message.edit_caption(
+        caption=new_text,
+        reply_markup=None  # Убираем кнопки
+    )
+    
+    # Уведомляем пользователя
+    try:
+        await bot.send_message(
+            user_id,
+            f"✅ Ваш баланс пополнен на {amount} руб.\n"
+            f"💼 Новый баланс: {users_db[user_id]['balance']} руб."
+        )
+    except:
+        pass  # Пользователь не начал диалог с ботом
+    
+    await callback.answer(f"Баланс пользователя пополнен на {amount} руб.")
+
+# Обработка нажатия на кнопку отклонения платежа
+@dp.callback_query(F.data.startswith("reject_payment_"))
+async def reject_payment(callback: types.CallbackQuery):
+    payment_id = int(callback.data.split("_")[2])
+    
+    # Находим заявку
+    payment = None
+    for p in pending_payments:
+        if p['id'] == payment_id and p['status'] == 'pending':
+            payment = p
+            break
+    
+    if not payment:
+        await callback.answer("Заявка не найдена или уже обработана", show_alert=True)
+        return
+    
+    user_id = payment['user_id']
+    
+    # Помечаем заявку как отклоненную
+    payment['status'] = 'rejected'
+    
+    # Обновляем сообщение у администратора
+    new_text = (
+        f"❌ ОТКЛОНЕНО\n\n"
+        f"👤 Пользователь: {payment['user_full_name']}\n"
+        f"📛 @{payment['username'] or 'Нет username'}\n"
+        f"🆔 ID: {payment['user_id']}\n"
+        f"💰 Сумма: {payment['amount']} руб.\n"
+        f"⏰ Время: {payment['timestamp']}\n"
+        f"🕐 Обработано: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    
+    await callback.message.edit_caption(
+        caption=new_text,
+        reply_markup=None  # Убираем кнопки
+    )
+    
+    # Уведомляем пользователя
+    try:
+        await bot.send_message(
+            user_id,
+            f"❌ Ваша заявка на пополнение баланса на {payment['amount']} руб. отклонена.\n\n"
+            f"Если вы считаете это ошибкой, свяжитесь с поддержкой."
+        )
+    except:
+        pass  # Пользователь не начал диалог с ботом
+    
+    await callback.answer("Заявка отклонена")
+
+# Ожидающие заказы
+@dp.message(F.text == "📋 Ожидающие заказы")
+async def show_pending_orders(message: types.Message):
+    if message.from_user.id != ADMIN_CHAT_ID:
+        await message.answer("Доступ запрещен")
+        return
+        
+    pending_orders = [o for o in orders_db if o.get('status') == 'pending']
+    
+    if not pending_orders:
+        await message.answer(
+            "Нет ожидающих заказов.",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    # Отправляем каждый заказ отдельным сообщением с кнопками
+    for order in pending_orders:
+        user_id = order['user_id']
+        user_data = users_db.get(user_id, {})
+        username = user_data.get('username', 'Неизвестно')
+        
+        text = (
+            f"📋 Заказ #{order['order_id']}\n\n"
+            f"👤 Пользователь: {order.get('user_full_name', 'Неизвестно')}\n"
+            f"📛 @{username or 'Нет username'}\n"
+            f"🆔 ID: {user_id}\n"
+            f"🔗 Ссылка: {order['link']}\n"
+            f"📊 Количество отзывов: {order['reviews_count']}\n"
+            f"📝 Текст: {order['review_text'][:100]}...\n"
+            f"📞 Контакты: {order['contacts']}\n"
+            f"💰 Стоимость: {order['cost']} руб.\n"
+            f"⏰ Время: {order['timestamp']}"
+        )
+        
+        # Создаем инлайн-кнопки
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Выполнен", callback_data=f"complete_order_{order['order_id']}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_order_{order['order_id']}")
+            ]
+        ])
+        
+        await message.answer(text, reply_markup=keyboard)
+    
+    await message.answer(
+        f"Всего ожидающих заказов: {len(pending_orders)}",
+        reply_markup=get_admin_keyboard()
+    )
+
+# Обработка нажатия на кнопку "Выполнен" для заказа
+@dp.callback_query(F.data.startswith("complete_order_"))
+async def complete_order(callback: types.CallbackQuery, state: FSMContext):
+    order_id = int(callback.data.split("_")[2])
+    
+    # Находим заказ
+    order = None
+    for o in orders_db:
+        if o['order_id'] == order_id and o.get('status') == 'pending':
+            order = o
+            break
+    
+    if not order:
+        await callback.answer("Заказ не найден или уже обработан", show_alert=True)
+        return
+    
+    # Сохраняем ID заказа в состоянии
+    await state.update_data(order_id=order_id)
+    
+    # Просим отправить скриншот отзыва
+    await callback.message.answer(
+        f"📸 Для заказа #{order_id} отправьте скриншот выполненного отзыва:",
+        reply_markup=get_cancel_keyboard()
+    )
+    
+    await state.set_state(AdminStates.waiting_for_screenshot)
+    await callback.answer()
+
+# Получение скриншота отзыва
+@dp.message(AdminStates.waiting_for_screenshot)
+async def process_review_screenshot(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_CHAT_ID:
+        await message.answer("Доступ запрещен")
+        return
+    
+    # Обработка отмены
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Операция отменена",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    # Проверяем, что это фото
+    if not message.photo:
+        await message.answer("Пожалуйста, отправьте скриншот отзыва:", reply_markup=get_cancel_keyboard())
+        return
+    
+    data = await state.get_data()
+    order_id = data['order_id']
+    
+    # Находим заказ
+    order = None
+    for o in orders_db:
+        if o['order_id'] == order_id:
+            order = o
+            break
+    
+    if not order:
+        await message.answer("Ошибка: заказ не найден", reply_markup=get_admin_keyboard())
+        await state.clear()
+        return
+    
+    user_id = order['user_id']
+    
+    # Помечаем заказ как выполненный
+    order['status'] = 'completed'
+    order['completed_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Отправляем скриншот пользователю
+    try:
+        await bot.send_photo(
+            user_id,
+            message.photo[-1].file_id,
+            caption=f"✅ Ваш заказ #{order_id} выполнен!\n\n"
+                   f"🔗 Ссылка: {order['link']}\n"
+                   f"📊 Количество отзывов: {order['reviews_count']}\n"
+                   f"💰 Стоимость: {order['cost']} руб.\n\n"
+                   f"Спасибо за заказ! 🎉"
+        )
+    except:
+        pass  # Пользователь не начал диалог с ботом
+    
+    await message.answer(
+        f"✅ Заказ #{order_id} выполнен!\n"
+        f"Скриншот отправлен пользователю.",
+        reply_markup=get_admin_keyboard()
+    )
+    
+    await state.clear()
+
+# Обработка нажатия на кнопку "Отклонить" для заказа
+@dp.callback_query(F.data.startswith("reject_order_"))
+async def reject_order_handler(callback: types.CallbackQuery, state: FSMContext):
+    order_id = int(callback.data.split("_")[2])
+    
+    # Находим заказ
+    order = None
+    for o in orders_db:
+        if o['order_id'] == order_id and o.get('status') == 'pending':
+            order = o
+            break
+    
+    if not order:
+        await callback.answer("Заказ не найден или уже обработан", show_alert=True)
+        return
+    
+    # Сохраняем ID заказа в состоянии
+    await state.update_data(order_id=order_id)
+    
+    # Просим написать причину отказа
+    await callback.message.answer(
+        f"📝 Для заказа #{order_id} укажите причину отказа:",
+        reply_markup=get_cancel_keyboard()
+    )
+    
+    await state.set_state(AdminStates.waiting_for_rejection_reason)
+    await callback.answer()
+
+# Получение причины отказа
+@dp.message(AdminStates.waiting_for_rejection_reason)
+async def process_rejection_reason(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_CHAT_ID:
+        await message.answer("Доступ запрещен")
+        return
+    
+    # Обработка отмены
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Операция отменена",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+    
+    data = await state.get_data()
+    order_id = data['order_id']
+    reason = message.text
+    
+    # Находим заказ
+    order = None
+    for o in orders_db:
+        if o['order_id'] == order_id:
+            order = o
+            break
+    
+    if not order:
+        await message.answer("Ошибка: заказ не найден", reply_markup=get_admin_keyboard())
+        await state.clear()
+        return
+    
+    user_id = order['user_id']
+    cost = order['cost']
+    
+    # Помечаем заказ как отклоненный
+    order['status'] = 'rejected'
+    order['rejected_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    order['rejection_reason'] = reason
+    
+    # Возвращаем деньги на баланс
+    init_user(user_id)
+    users_db[user_id]['balance'] += cost
+    
+    # Уведомляем пользователя
+    try:
+        await bot.send_message(
+            user_id,
+            f"❌ Ваш заказ #{order_id} отклонен.\n\n"
+            f"📝 Причина: {reason}\n\n"
+            f"💰 Стоимость заказа ({cost} руб.) возвращена на ваш баланс.\n"
+            f"💼 Новый баланс: {users_db[user_id]['balance']} руб.\n\n"
+            f"Если у вас есть вопросы, свяжитесь с поддержкой."
+        )
+    except:
+        pass  # Пользователь не начал диалог с ботом
+    
+    await message.answer(
+        f"❌ Заказ #{order_id} отклонен.\n"
+        f"💰 Деньги возвращены на баланс пользователя.",
+        reply_markup=get_admin_keyboard()
+    )
+    
+    await state.clear()
+
 # Статистика
 @dp.message(F.text == "📊 Статистика")
 async def show_stats(message: types.Message):
@@ -318,13 +747,19 @@ async def show_stats(message: types.Message):
     total_orders = len(orders_db)
     total_balance = sum(user['balance'] for user in users_db.values())
     active_users = len([user for user in users_db.values() if user['orders_count'] > 0])
+    pending_count = len([p for p in pending_payments if p['status'] == 'pending'])
+    pending_orders_count = len([o for o in orders_db if o.get('status') == 'pending'])
+    completed_orders_count = len([o for o in orders_db if o.get('status') == 'completed'])
     
     await message.answer(
         f"📊 Статистика:\n\n"
         f"👥 Всего пользователей: {total_users}\n"
         f"🔥 Активных пользователей: {active_users}\n"
         f"📦 Всего заказов: {total_orders}\n"
-        f"💰 Общий баланс: {total_balance} руб."
+        f"✅ Выполненных заказов: {completed_orders_count}\n"
+        f"⏳ Ожидающих заказов: {pending_orders_count}\n"
+        f"💰 Общий баланс: {total_balance} руб.\n"
+        f"💳 Ожидающих пополнений: {pending_count}"
     )
 
 # Назад в главное меню
@@ -472,13 +907,18 @@ async def process_contacts(message: types.Message, state: FSMContext):
     users_db[user_id]['orders_count'] += 1
 
     # Сохраняем заказ
+    order_id = generate_order_id()
     order_data = {
+        'order_id': order_id,
         'user_id': user_id,
+        'user_full_name': message.from_user.full_name,
         'link': user_data['link'],
         'reviews_count': user_data['reviews_count'],
         'review_text': user_data.get('review_text', 'Не указан'),
         'contacts': user_data['contacts'],
-        'cost': cost
+        'cost': cost,
+        'status': 'pending',
+        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     orders_db.append(order_data)
 
