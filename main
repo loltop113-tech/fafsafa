@@ -1,0 +1,549 @@
+import asyncio
+import logging
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.fsm.storage.memory import MemoryStorage
+
+# Настройки
+BOT_TOKEN = "8525067714:AAEDsOTfqxrmHhcM6by3x0sGkagDUwthHbQ"
+ADMIN_CHAT_ID = 6918401002  # ID администратора для уведомлений
+
+# Инициализация бота
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+# "База данных" пользователей (в реальном проекте используйте БД)
+users_db = {}
+orders_db = []
+
+# Стейты для FSM
+class OrderStates(StatesGroup):
+    waiting_for_link = State()
+    waiting_for_reviews_count = State()
+    waiting_for_review_text = State()
+    waiting_for_contacts = State()
+
+class AdminStates(StatesGroup):
+    waiting_for_user_id = State()
+    waiting_for_amount = State()
+
+class PaymentStates(StatesGroup):
+    waiting_for_amount = State()
+    waiting_for_screenshot = State()
+
+# Клавиатуры
+def get_main_keyboard(user_id):
+    keyboard = [
+        [KeyboardButton(text="📝 Заказать отзывы")],
+        [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="💳 Пополнить баланс")],
+        [KeyboardButton(text="ℹ️ Информация"), KeyboardButton(text="👨‍💻 Поддержка")]
+    ]
+    
+    if user_id == ADMIN_CHAT_ID:
+        keyboard.append([KeyboardButton(text="⚙️ Админ-панель")])
+    
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+def get_cancel_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="❌ Отмена")]],
+        resize_keyboard=True
+    )
+
+def get_skip_text_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="⏭ Пропустить")],
+            [KeyboardButton(text="❌ Отмена")]
+        ],
+        resize_keyboard=True
+    )
+
+def get_admin_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="💰 Пополнить баланс пользователю")],
+            [KeyboardButton(text="📊 Статистика")],
+            [KeyboardButton(text="⬅️ Назад")]
+        ],
+        resize_keyboard=True
+    )
+
+# Инициализация пользователя
+def init_user(user_id):
+    if user_id not in users_db:
+        users_db[user_id] = {
+            'balance': 0,
+            'username': '',
+            'orders_count': 0
+        }
+
+# Команда /start
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    init_user(user_id)
+    
+    await message.answer(
+        "Добро пожаловать! Я помогу вам заказать отзывы для вашего бизнеса в 2ГИС.\n\n"
+        "Выберите действие:",
+        reply_markup=get_main_keyboard(user_id)
+    )
+
+# Профиль пользователя
+@dp.message(F.text == "👤 Профиль")
+async def show_profile(message: types.Message):
+    user_id = message.from_user.id
+    init_user(user_id)
+    
+    user_data = users_db[user_id]
+    await message.answer(
+        f"📊 Ваш профиль:\n\n"
+        f"💼 Баланс: {user_data['balance']} руб.\n"
+        f"📦 Заказов: {user_data['orders_count']}\n"
+        f"👤 ID: {user_id}"
+    )
+
+# Пополнение баланса - начало
+@dp.message(F.text == "💳 Пополнить баланс")
+async def start_payment(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    init_user(user_id)
+    
+    await message.answer(
+        "💳 Пополнение баланса\n\n"
+        "Введите сумму пополнения (в рублях):\n\n"
+        "Минимальная сумма: 10 руб.\n"
+        "Максимальная сумма: 10000 руб.",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(PaymentStates.waiting_for_amount)
+
+# Получение суммы пополнения
+@dp.message(PaymentStates.waiting_for_amount)
+async def process_payment_amount(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    # Обработка отмены
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Пополнение баланса отменено",
+            reply_markup=get_main_keyboard(user_id)
+        )
+        return
+        
+    if not message.text.isdigit():
+        await message.answer("Пожалуйста, введите корректную сумму (число):", reply_markup=get_cancel_keyboard())
+        return
+        
+    amount = int(message.text)
+    
+    if amount < 10:
+        await message.answer("Минимальная сумма пополнения - 10 рублей:", reply_markup=get_cancel_keyboard())
+        return
+        
+    if amount > 10000:
+        await message.answer("Максимальная сумма пополнения - 10000 рублей:", reply_markup=get_cancel_keyboard())
+        return
+        
+    await state.update_data(amount=amount)
+    
+    await message.answer(
+        f"💳 Для пополнения баланса на {amount} руб.:\n\n"
+        "1. Переведите деньги по реквизитам:\n"
+        "💎 ОЗОН-БАНК: 2204320908458443\n"
+        "Получатель: Матвей\n\n"
+        "2. После оплаты отправьте скриншот чека или перевода\n\n"
+        "Баланс будет пополнен в течение 15 минут после проверки оплаты.",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(PaymentStates.waiting_for_screenshot)
+
+# Получение скриншота
+@dp.message(PaymentStates.waiting_for_screenshot)
+async def process_screenshot(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    # Обработка отмены
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Пополнение баланса отменено",
+            reply_markup=get_main_keyboard(user_id)
+        )
+        return
+    
+    user_data = await state.get_data()
+    amount = user_data['amount']
+    
+    # Если это не фото, просим отправить скриншот
+    if not message.photo:
+        await message.answer("Пожалуйста, отправьте скриншот чека об оплате:", reply_markup=get_cancel_keyboard())
+        return
+    
+    # Формируем заявку для администратора
+    payment_text = (
+        "💰 Новая заявка на пополнение баланса!\n\n"
+        f"👤 Пользователь: @{message.from_user.username or 'Нет username'}\n"
+        f"🆔 ID: {user_id}\n"
+        f"💳 Сумма: {amount} руб.\n"
+        f"📸 Скриншот отправлен"
+    )
+    
+    # Пересылаем скриншот администратору
+    await bot.send_photo(ADMIN_CHAT_ID, message.photo[-1].file_id, caption=payment_text)
+    
+    await message.answer(
+        "✅ Заявка на пополнение баланса отправлена!\n\n"
+        f"Сумма: {amount} руб.\n"
+        "Баланс будет пополнен в течение 15 минут после проверки оплаты администратором.",
+        reply_markup=get_main_keyboard(user_id)
+    )
+    
+    await state.clear()
+
+# Админ-панель
+@dp.message(F.text == "⚙️ Админ-панель")
+async def admin_panel(message: types.Message):
+    if message.from_user.id != ADMIN_CHAT_ID:
+        await message.answer("Доступ запрещен")
+        return
+        
+    total_users = len(users_db)
+    total_orders = len(orders_db)
+    total_balance = sum(user['balance'] for user in users_db.values())
+    
+    await message.answer(
+        f"⚙️ Админ-панель\n\n"
+        f"👥 Пользователей: {total_users}\n"
+        f"📊 Заказов: {total_orders}\n"
+        f"💰 Общий баланс: {total_balance} руб.",
+        reply_markup=get_admin_keyboard()
+    )
+
+# Пополнение баланса администратором
+@dp.message(F.text == "💰 Пополнить баланс пользователю")
+async def add_balance_start(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_CHAT_ID:
+        await message.answer("Доступ запрещен")
+        return
+        
+    await message.answer(
+        "Введите ID пользователя для пополнения:",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(AdminStates.waiting_for_user_id)
+
+# Получение ID пользователя
+@dp.message(AdminStates.waiting_for_user_id)
+async def get_user_id(message: types.Message, state: FSMContext):
+    # Обработка отмены
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Операция отменена",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+        
+    if not message.text.isdigit():
+        await message.answer("Пожалуйста, введите корректный ID пользователя (число):", reply_markup=get_cancel_keyboard())
+        return
+        
+    user_id = int(message.text)
+    await state.update_data(user_id=user_id)
+    
+    await message.answer(
+        "Введите сумму для пополнения:",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(AdminStates.waiting_for_amount)
+
+# Получение суммы и пополнение баланса
+@dp.message(AdminStates.waiting_for_amount)
+async def get_amount(message: types.Message, state: FSMContext):
+    # Обработка отмены
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer(
+            "Операция отменена",
+            reply_markup=get_admin_keyboard()
+        )
+        return
+        
+    if not message.text.isdigit():
+        await message.answer("Пожалуйста, введите корректную сумму (число):", reply_markup=get_cancel_keyboard())
+        return
+        
+    amount = int(message.text)
+    user_data = await state.get_data()
+    user_id = user_data['user_id']
+    
+    # Инициализируем пользователя если его нет
+    init_user(user_id)
+    
+    # Пополняем баланс
+    users_db[user_id]['balance'] += amount
+    
+    # Уведомляем пользователя
+    try:
+        await bot.send_message(
+            user_id,
+            f"✅ Ваш баланс пополнен на {amount} руб.\n"
+            f"💼 Новый баланс: {users_db[user_id]['balance']} руб."
+        )
+    except:
+        pass  # Пользователь не начал диалог с ботом
+    
+    await message.answer(
+        f"✅ Баланс пользователя {user_id} пополнен на {amount} руб.\n"
+        f"💼 Новый баланс: {users_db[user_id]['balance']} руб.",
+        reply_markup=get_admin_keyboard()
+    )
+    await state.clear()
+
+# Статистика
+@dp.message(F.text == "📊 Статистика")
+async def show_stats(message: types.Message):
+    if message.from_user.id != ADMIN_CHAT_ID:
+        await message.answer("Доступ запрещен")
+        return
+        
+    total_users = len(users_db)
+    total_orders = len(orders_db)
+    total_balance = sum(user['balance'] for user in users_db.values())
+    active_users = len([user for user in users_db.values() if user['orders_count'] > 0])
+    
+    await message.answer(
+        f"📊 Статистика:\n\n"
+        f"👥 Всего пользователей: {total_users}\n"
+        f"🔥 Активных пользователей: {active_users}\n"
+        f"📦 Всего заказов: {total_orders}\n"
+        f"💰 Общий баланс: {total_balance} руб."
+    )
+
+# Назад в главное меню
+@dp.message(F.text == "⬅️ Назад")
+async def back_to_main(message: types.Message):
+    user_id = message.from_user.id
+    await message.answer(
+        "Главное меню:",
+        reply_markup=get_main_keyboard(user_id)
+    )
+
+# Обработка кнопки "Заказать отзывы"
+@dp.message(F.text == "📝 Заказать отзывы")
+async def start_order(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    init_user(user_id)
+    
+    # Проверяем баланс
+    if users_db[user_id]['balance'] <= 0:
+        await message.answer(
+            "❌ Недостаточно средств на балансе.\n"
+            "Для заказа отзывов необходим положительный баланс.\n\n"
+            "Нажмите '💳 Пополнить баланс' для пополнения.",
+            reply_markup=get_main_keyboard(user_id)
+        )
+        return
+        
+    await message.answer(
+        "Пожалуйста, пришлите ссылку на ваше заведение в 2ГИС:",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(OrderStates.waiting_for_link)
+
+# Отмена во время заказа (общий обработчик)
+@dp.message(F.text == "❌ Отмена")
+async def cancel_order(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        return
+        
+    await state.clear()
+    user_id = message.from_user.id
+    await message.answer(
+        "Операция отменена",
+        reply_markup=get_main_keyboard(user_id)
+    )
+
+# Прием ссылки
+@dp.message(OrderStates.waiting_for_link)
+async def process_link(message: types.Message, state: FSMContext):
+    # Обработка отмены
+    if message.text == "❌ Отмена":
+        await cancel_order(message, state)
+        return
+        
+    if not ("2gis.ru" in message.text or "2gis.kz" in message.text):
+        await message.answer("Пожалуйста, пришлите корректную ссылку на 2ГИС:", reply_markup=get_cancel_keyboard())
+        return
+
+    await state.update_data(link=message.text)
+    await message.answer("Сколько отзывов вам нужно?", reply_markup=get_cancel_keyboard())
+    await state.set_state(OrderStates.waiting_for_reviews_count)
+
+# Прием количества отзывов
+@dp.message(OrderStates.waiting_for_reviews_count)
+async def process_reviews_count(message: types.Message, state: FSMContext):
+    # Обработка отмены
+    if message.text == "❌ Отмена":
+        await cancel_order(message, state)
+        return
+        
+    if not message.text.isdigit():
+        await message.answer("Пожалуйста, введите число:", reply_markup=get_cancel_keyboard())
+        return
+
+    reviews_count = int(message.text)
+    if reviews_count > 50:
+        await message.answer("Слишком большое количество. Максимум 50 отзывов за раз:", reply_markup=get_cancel_keyboard())
+        return
+
+    await state.update_data(reviews_count=reviews_count)
+    
+    await message.answer(
+        "Напишите текст отзыва (или несколько вариантов через запятую):\n\n"
+        "Или нажмите 'Пропустить', если хотите чтобы мы составили текст самостоятельно",
+        reply_markup=get_skip_text_keyboard()
+    )
+    await state.set_state(OrderStates.waiting_for_review_text)
+
+# Прием текста отзыва
+@dp.message(OrderStates.waiting_for_review_text)
+async def process_review_text(message: types.Message, state: FSMContext):
+    # Обработка отмены
+    if message.text == "❌ Отмена":
+        await cancel_order(message, state)
+        return
+        
+    if message.text == "⏭ Пропустить":
+        review_text = "Текст не указан (будет сгенерирован автоматически)"
+    else:
+        if len(message.text) < 10:
+            await message.answer("Текст отзыва слишком короткий. Минимум 10 символов:", reply_markup=get_skip_text_keyboard())
+            return
+        if len(message.text) > 1000:
+            await message.answer("Текст отзыва слишком длинный. Максимум 1000 символов:", reply_markup=get_skip_text_keyboard())
+            return
+        review_text = message.text
+
+    await state.update_data(review_text=review_text)
+    await message.answer(
+        "Оставьте ваши контакты для связи (телефон или Telegram):",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state(OrderStates.waiting_for_contacts)
+
+# Прием контактов и завершение заказа
+@dp.message(OrderStates.waiting_for_contacts)
+async def process_contacts(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    # Обработка отмены
+    if message.text == "❌ Отмена":
+        await cancel_order(message, state)
+        return
+        
+    await state.update_data(contacts=message.text)
+    user_data = await state.get_data()
+
+    # Рассчитываем стоимость (примерная формула)
+    cost = user_data['reviews_count'] * 10  # 10 руб за отзыв
+    
+    # Проверяем баланс
+    if users_db[user_id]['balance'] < cost:
+        await message.answer(
+            f"❌ Недостаточно средств. Стоимость заказа: {cost} руб.\n"
+            f"💼 Ваш баланс: {users_db[user_id]['balance']} руб.\n\n"
+            "Пополните баланс и попробуйте снова.",
+            reply_markup=get_main_keyboard(user_id)
+        )
+        await state.clear()
+        return
+
+    # Списание средств
+    users_db[user_id]['balance'] -= cost
+    users_db[user_id]['orders_count'] += 1
+
+    # Сохраняем заказ
+    order_data = {
+        'user_id': user_id,
+        'link': user_data['link'],
+        'reviews_count': user_data['reviews_count'],
+        'review_text': user_data.get('review_text', 'Не указан'),
+        'contacts': user_data['contacts'],
+        'cost': cost
+    }
+    orders_db.append(order_data)
+
+    # Формируем текст заказа для администратора
+    order_text = (
+        "📨 Новый заказ отзывов!\n\n"
+        f"🔗 Ссылка: {user_data['link']}\n"
+        f"📊 Количество отзывов: {user_data['reviews_count']}\n"
+        f"📝 Текст отзыва: {user_data.get('review_text', 'Не указан')}\n"
+        f"📞 Контакты: {user_data['contacts']}\n"
+        f"💰 Стоимость: {cost} руб.\n"
+        f"👤 Пользователь: @{message.from_user.username or 'Нет username'}\n"
+        f"🆔 ID: {message.from_user.id}\n"
+        f"💼 Баланс после списания: {users_db[user_id]['balance']} руб."
+    )
+
+    # Отправка заказа администратору
+    await bot.send_message(ADMIN_CHAT_ID, order_text)
+    
+    # Подтверждение пользователю
+    await message.answer(
+        "✅ Ваш заказ принят!\n\n"
+        f"• Ссылка: {user_data['link']}\n"
+        f"• Количество отзывов: {user_data['reviews_count']}\n"
+        f"• Текст: {user_data.get('review_text', 'Будет сгенерирован автоматически')}\n"
+        f"• Стоимость: {cost} руб.\n"
+        f"• Баланс после списания: {users_db[user_id]['balance']} руб.\n\n"
+        "С вами свяжутся в ближайшее время для уточнения деталей.",
+        reply_markup=get_main_keyboard(user_id)
+    )
+    await state.clear()
+
+# Обработка остальных кнопок
+@dp.message(F.text == "ℹ️ Информация")
+async def show_info(message: types.Message):
+    await message.answer(
+        "💼 Услуги по продвижению в 2ГИС\n\n"
+        "✅ Гарантируем качественные и естественные отзывы\n"
+        "✅ Работаем быстро и анонимно\n"
+        "✅ Индивидуальный подход к каждому клиенту\n"
+        "✅ Возможность указать свой текст отзыва\n\n"
+        "💰 Стоимость: 10 руб. за 1 отзыв\n\n"
+    )
+
+@dp.message(F.text == "👨‍💻 Поддержка")
+async def show_support(message: types.Message):
+    await message.answer(
+        "По всем вопросам обращайтесь к нашему менеджеру:\n"
+        "📞 @grackswag\n"
+        "Время работы: 10:00 - 20:00 ежедневно"
+    )
+
+# Обработка любых других сообщений
+@dp.message()
+async def handle_other_messages(message: types.Message):
+    user_id = message.from_user.id
+    await message.answer(
+        "Используйте кнопки меню для навигации:",
+        reply_markup=get_main_keyboard(user_id)
+    )
+
+# Запуск бота
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
